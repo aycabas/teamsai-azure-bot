@@ -1,7 +1,6 @@
 // Import required packages
 import * as restify from "restify";
 
-import { Application, ConversationHistory, DefaultPromptManager, DefaultTurnState, OpenAIModerator, OpenAIPlanner, AI, AzureOpenAIPlanner } from '@microsoft/teams-ai';
 import path from "path";
 // Import required bot services.
 // See https://aka.ms/bot-services to learn more about the different parts of a bot.
@@ -65,23 +64,45 @@ server.listen(process.env.port || process.env.PORT || 3978, () => {
   console.log(`\nBot Started, ${server.name} listening to ${server.url}`);
 });
 
-// eslint-disable-next-line @typescript-eslint/no-empty-interface
-interface ConversationState {}
-type ApplicationTurnState = DefaultTurnState<ConversationState>;
+import {
+  Application,
+  DefaultTurnState,
+  OpenAIPlanner,
+  AI,
+  DefaultConversationState,
+  DefaultUserState,
+  DefaultTempState,
+  DefaultPromptManager,
+  AzureOpenAIPlanner
+} from '@microsoft/teams-ai';
+import * as responses from './responses';
+
+// Strongly type the applications turn state
+interface ConversationState extends DefaultConversationState {
+  greeted: boolean;
+  listNames: string[];
+  lists: Record<string, string[]>;
+}
+
+type UserState = DefaultUserState;
+
+interface TempState extends DefaultTempState {
+  lists: Record<string, string[]>;
+}
+
+type ApplicationTurnState = DefaultTurnState<ConversationState, UserState, TempState>;
+
 
 // Create AI components
 const planner = new AzureOpenAIPlanner({
   apiKey: config.openAIKey,
   endpoint: config.openAIEndpoint,
+  apiVersion:'2023-03-15-preview', 
   defaultModel: 'gpt-35-turbo',
   logRequests: true,
   useSystemMessage: true
 });
-const moderator = new OpenAIModerator({
-  apiKey: config.openAIKey,
-  moderate: 'both'
-});
-const promptManager = new DefaultPromptManager(path.join(__dirname, './prompts' ));
+const promptManager = new DefaultPromptManager<ApplicationTurnState>(path.join(__dirname, './prompts'));
 
 // Define storage and application
 const storage = new MemoryStorage();
@@ -89,32 +110,164 @@ const app = new Application<ApplicationTurnState>({
   storage,
   ai: {
       planner,
-      moderator,
       promptManager,
-      prompt: 'chat',
-      history: {
-          assistantHistoryType: 'text'
-      }
+      prompt: 'chatGPT'
   }
 });
 
-app.ai.action(AI.FlaggedInputActionName, async (context, state, data) => {
-  await context.sendActivity(`I'm sorry your message was flagged: ${JSON.stringify(data)}`);
+// Define an interface to strongly type data parameters for actions
+interface EntityData {
+  list: string; // <- populated by GPT
+  item: string; // <- populated by GPT
+}
+
+// Listen for new members to join the conversation
+app.conversationUpdate('membersAdded', async (context: TurnContext, state: ApplicationTurnState) => {
+  if (!state.conversation.value.greeted) {
+      state.conversation.value.greeted = true;
+      await context.sendActivity(responses.greeting());
+  }
+});
+
+// List for /reset command and then delete the conversation state
+app.message('/reset', async (context: TurnContext, state: ApplicationTurnState) => {
+  state.conversation.delete();
+  await context.sendActivity(responses.reset());
+});
+
+// Register action handlers
+app.ai.action('createList', async (context: TurnContext, state: ApplicationTurnState, data: EntityData) => {
+  ensureListExists(state, data.list);
+  return true;
+});
+
+app.ai.action('deleteList', async (context: TurnContext, state: ApplicationTurnState, data: EntityData) => {
+  deleteList(state, data.list);
+  return true;
+});
+
+app.ai.action('addItem', async (context: TurnContext, state: ApplicationTurnState, data: EntityData) => {
+  const items = getItems(state, data.list);
+  items.push(data.item);
+  setItems(state, data.list, items);
+  return true;
+});
+
+app.ai.action('removeItem', async (context: TurnContext, state: ApplicationTurnState, data: EntityData) => {
+  const items = getItems(state, data.list);
+  const index = items.indexOf(data.item);
+  if (index >= 0) {
+      items.splice(index, 1);
+      setItems(state, data.list, items);
+      return true;
+  } else {
+      await context.sendActivity(responses.itemNotFound(data.list, data.item));
+
+      // End the current chain
+      return false;
+  }
+});
+
+app.ai.action('findItem', async (context: TurnContext, state: ApplicationTurnState, data: EntityData) => {
+  const items = getItems(state, data.list);
+  const index = items.indexOf(data.item);
+  if (index >= 0) {
+      await context.sendActivity(responses.itemFound(data.list, data.item));
+  } else {
+      await context.sendActivity(responses.itemNotFound(data.list, data.item));
+  }
+
+  // End the current chain
   return false;
 });
 
-app.ai.action(AI.FlaggedOutputActionName, async (context, state, data) => {
-  await context.sendActivity(`I'm not allowed to talk about such things.`);
+app.ai.action('summarizeLists', async (context: TurnContext, state: ApplicationTurnState, data: EntityData) => {
+  const lists = state.conversation.value.lists;
+  if (lists) {
+      // Chain into a new summarization prompt
+      state.temp.value.lists = lists;
+      await app.ai.chain(context, state, 'summarize');
+  } else {
+      await context.sendActivity(responses.noListsFound());
+  }
+
+  // End the current chain
   return false;
 });
 
-app.message('/history', async (context, state) => {
-  const history = ConversationHistory.toString(state, 2000, '\n\n');
-  await context.sendActivity(history);
-  });
-// Listen for incoming requests.
-server.post("/api/messages", async (req, res) => {
-  await adapter.process(req, res, async (context) => {
-    await app.run(context);
+// Register a handler to handle unknown actions that might be predicted
+app.ai.action(
+  AI.UnknownActionName,
+  async (context: TurnContext, state: ApplicationTurnState, data: EntityData, action?: string) => {
+      await context.sendActivity(responses.unknownAction(action!));
+      return false;
+  }
+);
+
+// Listen for incoming server requests.
+server.post('/api/messages', async (req, res) => {
+  // Route received a request to adapter for processing
+  await adapter.process(req, res as any, async (context) => {
+      // Dispatch to application for routing
+      await app.run(context);
   });
 });
+
+/**
+* Retrieves the items for a given list from the conversation state.
+* @param {ApplicationTurnState} state - The current turn state.
+* @param {string} list - The name of the list to retrieve items for.
+* @returns {string[]} - The items in the specified list.
+*/
+function getItems(state: ApplicationTurnState, list: string): string[] {
+  ensureListExists(state, list);
+  return state.conversation.value.lists[list];
+}
+
+/**
+* Sets the items for a given list in the conversation state.
+* @param {ApplicationTurnState} state - The current turn state.
+* @param {string} list - The name of the list to set items for.
+* @param {string[]} items - The items to set for the specified list.
+*/
+function setItems(state: ApplicationTurnState, list: string, items: string[]): void {
+  ensureListExists(state, list);
+  state.conversation.value.lists[list] = items ?? [];
+}
+
+/**
+* Ensures that a list with the given name exists in the conversation state.
+* @param {ApplicationTurnState} state - The current turn state.
+* @param {string} listName - The name of the list to ensure exists.
+*/
+function ensureListExists(state: ApplicationTurnState, listName: string): void {
+  const conversation = state.conversation.value;
+  if (typeof conversation.lists != 'object') {
+      conversation.lists = {};
+      conversation.listNames = [];
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(conversation.lists, listName)) {
+      conversation.lists[listName] = [];
+      conversation.listNames.push(listName);
+  }
+}
+
+/**
+* Deletes a list from the conversation state.
+* @param {ApplicationTurnState} state - The current turn state.
+* @param {string} listName - The name of the list to delete.
+*/
+function deleteList(state: ApplicationTurnState, listName: string): void {
+  const conversation = state.conversation.value;
+  if (typeof conversation.lists == 'object' && Object.prototype.hasOwnProperty.call(conversation.lists, listName)) {
+      delete conversation.lists[listName];
+  }
+
+  if (Array.isArray(conversation.listNames)) {
+      const pos = conversation.listNames.indexOf(listName);
+      if (pos >= 0) {
+          conversation.listNames.splice(pos, 1);
+      }
+  }
+}
